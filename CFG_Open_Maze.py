@@ -455,16 +455,17 @@ def compute_mid_goal_achieved(trajectory_info: List[Dict[str, np.ndarray]],
 
 def evaluate(agent: PlanningAgent,
              env: gym.Env,
+             global_step: int,
              epoches: int = 10,
              use_wandb: bool = True,
-             device: str = 'cpu') -> Tuple[np.floating, np.floating, np.floating, np.floating, List[np.floating], List[np.floating]]:
+             device: str = 'cpu') -> int:
 
     agent.eval()
 
     epoch = 0
+    total_reward = 0
     step_info = []
     reward_info = []
-    norm_total_reward_info = []
     success_rate_info = []
 
     pbar = tqdm(total=epoches, leave=True, dynamic_ncols=True)
@@ -477,7 +478,7 @@ def evaluate(agent: PlanningAgent,
         obs = torch.tensor(obs_dict['achieved_goal'], device=device)
         goal = torch.tensor(obs_dict['desired_goal'], device=device)
         done = info['success']
-        total_reward = 0.0
+        roll_reward = 0.0
         roll_step = 0
 
         while not done:
@@ -487,6 +488,7 @@ def evaluate(agent: PlanningAgent,
                 obs = torch.tensor(obs_dict['achieved_goal'], device=device)
                 goal = torch.tensor(obs_dict['desired_goal'], device=device)
                 done = info['success'] or truncated
+                roll_reward += reward
                 total_reward += reward
                 roll_step += 1
 
@@ -496,7 +498,7 @@ def evaluate(agent: PlanningAgent,
                 trajectory_info.append(obs_dict)
                 mid_goal_list_info.append(mid_goal_list)
 
-        norm_total_reward = (total_reward - 23.85) / (161.86 - 23.85)
+        global_step += 1
         n_level_goal_achieved, n_level_goal_counts = compute_mid_goal_achieved(trajectory_info, mid_goal_list_info)
         success_rate = [float(g / c) if c != 0 else 0 for g, c in zip(n_level_goal_achieved, n_level_goal_counts)]
         success_rate_info.append(success_rate)
@@ -505,43 +507,52 @@ def evaluate(agent: PlanningAgent,
             wandb.log({
                 **{
                     'Test/Roll Step': roll_step,
-                    'Test/Total Reward': total_reward,
-                    'Test/Norm Total Reward': norm_total_reward
+                    'Test/Roll Reward': roll_reward,
+                    'Test/Total Reward': total_reward
                 },
                 **{f'Test/Success Rate/Depth_{i + 1}': v for i, v in enumerate(success_rate)}
-            })
+            }, step=global_step)
 
         epoch += 1
         pbar.update(1)
         pbar.set_description(f'Testing Epoch: {epoch} / {epoches}, Mean = {np.nanmean(reward_info) if reward_info else 0:.9f}, Std = {np.nanstd(reward_info) if reward_info else 0:.9f}')
 
         step_info.append(roll_step)
-        reward_info.append(total_reward)
-        norm_total_reward_info.append(norm_total_reward)
+        reward_info.append(roll_reward)
 
     pbar.close()
+    if use_wandb:
+        wandb.log({
+            **{
+                'Test/Mean': np.nanmean(reward_info),
+                'Test/Std': np.nanstd(reward_info)
+            },
+            **{f'Test/Success Mean/Depth_{i + 1}': v for i, v in enumerate(np.nanmean(success_rate_info, axis=0))},
+            **{f'Test/Success Std/Depth_{i + 1}': v for i, v in enumerate(np.nanstd(success_rate_info, axis=0))}
+        }, step=global_step)
 
-    return np.nanmean(reward_info), np.nanstd(reward_info), np.nanmean(norm_total_reward_info), np.nanstd(norm_total_reward_info), np.nanmean(success_rate_info, axis=0), np.nanstd(success_rate_info, axis=0)
+    return global_step
 
 
 def train(agent: PlanningAgent,
           env: gym.Env,
           dataloader: DataLoader,
+          global_step: int,
           optimizer: torch.optim.Optimizer | None = None,
           use_wandb: bool = True,
-          lr: float = 1e-4,
+          lr: float = 3e-4,
           weight_decay: float = 1e-5,
           train_steps: int = 100_000,
           eval_interval: int = 1_000,
           log_interval: int = 10,
-          planner_save_path: str = 'open_maze_planner_17.pt',
+          planner_save_path: str = 'open_maze_planner_18.pt',
           device: str = 'cpu') -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
 
     if use_wandb:
         wandb.init(
             mode='online',
             project='Open Maze Training Steps Based',
-            name='Open Maze Training 32 Length, 8 Batch Size',
+            name='Open Maze Training 32 Length, 8 Batch Size, lr=3e-4',
             config={
                 'lr': lr,
                 'weight_decay': weight_decay,
@@ -606,6 +617,7 @@ def train(agent: PlanningAgent,
             optimizer.step()
 
             step += 1
+            global_step += 1
             pbar.update(1)
             pbar.set_description(f'Train Step: {step} / {train_steps}, Current Loss = {loss.item():.9f}, Average loss = {average_loss:.9f}')
 
@@ -618,21 +630,11 @@ def train(agent: PlanningAgent,
                     'Train/Actor Grad': actor_grad,
                     'Train/Terminal Grad': terminal_grad,
                     'Train/Mid Goal Grad': mid_goal_grad
-                }, step=step)
+                }, step=global_step)
 
             if step % eval_interval == 0 or step == train_steps:
-                mean, std, norm_mean, norm_std, success_mean, success_std = evaluate(agent, env, device=device)
-                if use_wandb:
-                    wandb.log({
-                        **{
-                            'Test/Mean': mean,
-                            'Test/Std': std,
-                            'Test/Norm Mean': norm_mean,
-                            'Test/Norm Std': norm_std
-                        },
-                        **{f'Test/Success Mean/Depth_{i + 1}': v for i, v in enumerate(success_mean)},
-                        **{f'Test/Success Std/Depth_{i + 1}': v for i, v in enumerate(success_std)}
-                    }, step=step)
+                global_step = evaluate(agent, env, global_step, device=device)
+                agent.train()
 
     pbar.close()
 
@@ -643,9 +645,9 @@ def train(agent: PlanningAgent,
     torch.save(agent.state_dict(), planner_save_path)
     print(f'Saved planner model to {planner_save_path}')
 
-    torch.save(log_L, 'log_l_17.pt')
-    torch.save(log_optimal_idx, 'log_optimal_idx_17.pt')
-    torch.save(log_tree_depth, 'log_tree_depth_17.pt')
+    torch.save(log_L, 'log_l_18.pt')
+    torch.save(log_optimal_idx, 'log_optimal_idx_18.pt')
+    torch.save(log_tree_depth, 'log_tree_depth_18.pt')
     print('Saved all log files.')
 
     return log_L, log_optimal_idx, log_tree_depth
@@ -683,15 +685,16 @@ def main():
     print(f'Original Trajectory: {len(minari_dataset)}')
     print(f'Clip Trajectory: {len(episode_dataset)}')
 
+    global_step = 0
     obs_dim = episode_dataset[0]['observations'].shape[-1]
     action_dim = episode_dataset[0]['actions'].shape[-1]
     goal_dim = episode_dataset[0]['goals'].shape[-1]
 
     agent: PlanningAgent = PlanningAgent([(obs_dim + goal_dim + goal_dim + 1), 64, 128, 64, 1], [(obs_dim + goal_dim), 64, 128, 64, goal_dim], [(obs_dim + goal_dim), 64, 128, 64, action_dim]).to(device=device)
-    log_L, log_optimal_idx, log_tree_depth = train(agent, env, episode_data_loader, device=device)
+    log_L, log_optimal_idx, log_tree_depth = train(agent, env, episode_data_loader, global_step, device=device)
 
     plot_trajectory_length_histogram(episode_dataset)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
