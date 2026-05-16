@@ -1031,10 +1031,11 @@ def main():
     chunk_size = 4
     execute_mode = 'chunk'
     lr = 1e-5
-    max_length = 128
-    batch_size = 512
-    hidden_dims = 512
+    max_length = 32
+    batch_size = 64
+    hidden_dims = 128
     use_average_model = True
+    use_baseline = True
     file_no = 17
 
     is_hierarchical = chunk_size is not None
@@ -1059,7 +1060,7 @@ def main():
         goal_dim = hierarchical_dataset[0]['high_goals'].shape[-1]
 
         agent: PlanningAgent = PlanningAgent([(obs_dim + goal_dim + goal_dim + 1), hidden_dims, hidden_dims, 1], [(obs_dim + goal_dim), hidden_dims, hidden_dims, goal_dim], [(obs_dim + goal_dim), hidden_dims, hidden_dims, (action_dim * chunk_size)], chunk_size=chunk_size).to(device=device)
-        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, hierarchical_data_loader, max_length, batch_size, hidden_dims, chunk_size=chunk_size, execute_mode=execute_mode, lr=lr, use_average_model=use_average_model, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
+        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, hierarchical_data_loader, max_length, batch_size, hidden_dims, chunk_size=chunk_size, execute_mode=execute_mode, lr=lr, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
 
         plot_trajectory_length_histogram(hierarchical_dataset, max_length // chunk_size)
         plot_distance_histogram(hierarchical_dataset)
@@ -1075,7 +1076,7 @@ def main():
         goal_dim = episode_dataset[0]['goals'].shape[-1]
 
         agent: PlanningAgent = PlanningAgent([(obs_dim + goal_dim + goal_dim + 1), hidden_dims, hidden_dims, 1], [(obs_dim + goal_dim), hidden_dims, hidden_dims, goal_dim], [(obs_dim + goal_dim), hidden_dims, hidden_dims, action_dim]).to(device=device)
-        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, episode_data_loader, max_length, batch_size, hidden_dims, lr=lr, use_average_model=use_average_model, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
+        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, episode_data_loader, max_length, batch_size, hidden_dims, lr=lr, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
 
         plot_trajectory_length_histogram(episode_dataset, max_length)
         plot_distance_histogram(episode_dataset)
