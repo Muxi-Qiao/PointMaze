@@ -52,7 +52,7 @@ class EpisodeDataset(Dataset):
         for ep_id in trange(minari_dataset.total_episodes):
             ep = minari_dataset[ep_id]
 
-            observations = ep.observations['achieved_goal']
+            observations = ep.observations['observation']
             actions = ep.actions
             rewards = ep.rewards
             done = ep.truncations
@@ -65,9 +65,9 @@ class EpisodeDataset(Dataset):
                 actions = actions[:random_len]
                 rewards = rewards[:random_len]
                 done = done[:random_len]
-                goals = observations[:random_len + 1]
+                goals = goals[:random_len + 1]
 
-                rewards[-1] = 1
+                rewards[-1] = 1.0
                 done[-1] = True
 
             observations = torch.as_tensor(observations, dtype=torch.float32)
@@ -83,6 +83,58 @@ class EpisodeDataset(Dataset):
                 'done': done,
                 'goals': goals
             })
+
+        return cls(data)
+
+    @classmethod
+    def create_fixed_length(cls, minari_dataset: minari.MinariDataset, max_length: int = 32, stride: int | None = None, force_done: bool = True, force_reward: bool = True) -> Self:
+        if stride is None:
+            stride = max_length
+
+        data = []
+
+        for ep_id in trange(minari_dataset.total_episodes):
+            ep = minari_dataset[ep_id]
+
+            observations = ep.observations['observation']
+            actions = ep.actions
+            rewards = ep.rewards
+            done = ep.truncations
+            goals = ep.observations['achieved_goal']
+
+            T = len(actions)
+
+            if T < max_length:
+                continue
+
+            for start in range(0, T - max_length + 1, stride):
+                end = start + max_length
+
+                seg_observations = observations[start:end + 1]
+                seg_actions = actions[start:end]
+                seg_rewards = rewards[start:end].copy()
+                seg_done = done[start:end].copy()
+                seg_goals = goals[start:end + 1]
+
+                if force_done:
+                    seg_done[-1] = True
+
+                if force_reward:
+                    seg_rewards[-1] = 1.0
+
+                seg_observations = torch.as_tensor(seg_observations, dtype=torch.float32)
+                seg_actions = torch.as_tensor(seg_actions, dtype=torch.float32)
+                seg_rewards = torch.as_tensor(seg_rewards, dtype=torch.float32)
+                seg_done = torch.as_tensor(seg_done, dtype=torch.float32)
+                seg_goals = torch.as_tensor(seg_goals, dtype=torch.float32)
+
+                data.append({
+                    'observations': seg_observations,
+                    'actions': seg_actions,
+                    'rewards': seg_rewards,
+                    'done': seg_done,
+                    'goals': seg_goals
+                })
 
         return cls(data)
 
@@ -111,7 +163,7 @@ class HierarchicalDataset(Dataset):
         for ep_id in trange(minari_dataset.total_episodes):
             ep = minari_dataset[ep_id]
 
-            observations = ep.observations['achieved_goal']
+            observations = ep.observations['observation']
             actions = ep.actions
             rewards = ep.rewards
             done = ep.truncations
@@ -131,7 +183,7 @@ class HierarchicalDataset(Dataset):
                 done = done[:random_len]
                 goals = goals[:random_len + 1]
 
-                rewards[-1] = 1
+                rewards[-1] = 1.0
                 done[-1] = True
 
                 T = random_len
@@ -173,6 +225,73 @@ class HierarchicalDataset(Dataset):
 
         return cls(data)
 
+    @classmethod
+    def create_fixed_length(cls, minari_dataset: minari.MinariDataset, chunk_size: int = 4, max_length: int = 32, stride: int | None = None, force_done: bool = True, force_reward: bool = True) -> Self:
+        if stride is None:
+            stride = max_length
+
+        data = []
+
+        for ep_id in trange(minari_dataset.total_episodes):
+            ep = minari_dataset[ep_id]
+
+            observations = ep.observations['observation']
+            actions = ep.actions
+            rewards = ep.rewards
+            done = ep.truncations
+            goals = ep.observations['achieved_goal']
+
+            T = len(actions)
+
+            if T < max_length:
+                continue
+
+            for start in range(0, T - max_length + 1, stride):
+                for offset in range(chunk_size):
+                    real_start = start + offset
+                    real_end = real_start + max_length
+
+                    if real_end > T:
+                        continue
+
+                    seg_observations = observations[real_start:real_end + 1]
+                    seg_actions = actions[real_start:real_end]
+                    seg_rewards = rewards[real_start:real_end].copy()
+                    seg_done = done[real_start:real_end].copy()
+                    seg_goals = goals[real_start:real_end + 1]
+
+                    if force_done:
+                        seg_done[-1] = True
+
+                    if force_reward:
+                        seg_rewards[-1] = 1.0
+
+                    high_observations = seg_observations[0:max_length + 1:chunk_size]
+                    high_goals = seg_goals[0:max_length + 1:chunk_size]
+
+                    low_observations = []
+                    low_goals = []
+                    low_actions = []
+
+                    for t in range(0, max_length - chunk_size + 1):
+                        low_observations.append(seg_observations[t])
+                        low_goals.append(seg_goals[t + chunk_size])
+                        low_actions.append(seg_actions[t:t + chunk_size])
+
+                    data.append({
+                        'high_observations': torch.as_tensor(high_observations, dtype=torch.float32),
+                        'high_goals': torch.as_tensor(high_goals, dtype=torch.float32),
+
+                        'low_observations': torch.as_tensor(np.asarray(low_observations), dtype=torch.float32),
+                        'low_goals': torch.as_tensor(np.asarray(low_goals), dtype=torch.float32),
+                        'low_actions': torch.as_tensor(np.asarray(low_actions), dtype=torch.float32),
+
+                        'rewards': torch.as_tensor(seg_rewards, dtype=torch.float32),
+                        'done': torch.as_tensor(seg_done, dtype=torch.float32),
+                    })
+
+        return cls(data)
+
 
 class GroupByLengthSampler(Sampler):
 
@@ -186,10 +305,7 @@ class GroupByLengthSampler(Sampler):
         return len(self.all_batches)
 
     @staticmethod
-    def estimate_batch_size(length: int,
-                            base_memory: int,
-                            bucket_size: int,
-                            max_batch_size: int | None = None) -> int:
+    def estimate_batch_size(length: int, base_memory: int, bucket_size: int, max_batch_size: int | None = None) -> int:
         batch_size = min(max((base_memory // (length ** 3 * 4)), 1), bucket_size)
 
         if max_batch_size is not None:
@@ -230,6 +346,92 @@ class GroupByLengthSampler(Sampler):
             random.shuffle(all_batches)
 
         return cls(all_batches)
+
+
+def episode_random_future_goal_collate_fn(batch) -> Dict[str, torch.Tensor]:
+    obs_batch = []
+    goal_batch = []
+    action_batch = []
+    reward_batch = []
+    done_batch = []
+
+    for ep in batch:
+        observations = ep['observations']
+        actions = ep['actions']
+        goals = ep['goals']
+        rewards = ep['rewards']
+        done = ep['done']
+
+        T = actions.shape[0]
+        obs = observations[:T]
+        future_goal_indices = torch.empty(T, dtype=torch.int64)
+
+        for i in range(T):
+            future_goal_indices[i] = torch.randint(low=i + 1, high=T + 1, size=(1,))
+        goals = goals[future_goal_indices]
+
+        obs_batch.append(obs)
+        goal_batch.append(goals)
+        action_batch.append(actions)
+        reward_batch.append(rewards)
+        done_batch.append(done)
+
+    return {
+        'observations': torch.stack(obs_batch, dim=0),
+        'goals': torch.stack(goal_batch, dim=0),
+        'actions': torch.stack(action_batch, dim=0),
+        'rewards': torch.stack(reward_batch, dim=0),
+        'done': torch.stack(done_batch, dim=0),
+    }
+
+
+def hierarchical_random_future_goal_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    high_obs_batch = []
+    high_goal_batch = []
+    low_obs_batch = []
+    low_goal_batch = []
+    low_action_batch = []
+    reward_batch = []
+    done_batch = []
+
+    for ep in batch:
+        high_observations = ep['high_observations']  # (H + 1, obs_dim)
+        high_goals = ep['high_goals']                # (H + 1, goal_dim)
+        H = high_observations.shape[0] - 1
+        high_obs = high_observations[:H]
+        high_goal_indices = torch.empty(H, dtype=torch.long)
+
+        for i in range(H):
+            high_goal_indices[i] = torch.randint(low=i + 1, high=H + 1, size=(1,))
+
+        sampled_high_goals = high_goals[high_goal_indices]
+        low_observations = ep['low_observations']  # (L, obs_dim)
+        low_goals = ep['low_goals']                # (L, goal_dim)
+        low_actions = ep['low_actions']            # (L, chunk_size, action_dim)
+        L = low_observations.shape[0]
+        low_goal_indices = torch.empty(L, dtype=torch.int64)
+
+        for i in range(L):
+            low_goal_indices[i] = torch.randint(low=i, high=L, size=(1,))
+
+        sampled_low_goals = low_goals[low_goal_indices]
+        high_obs_batch.append(high_obs)
+        high_goal_batch.append(sampled_high_goals)
+        low_obs_batch.append(low_observations)
+        low_goal_batch.append(sampled_low_goals)
+        low_action_batch.append(low_actions)
+        reward_batch.append(ep['rewards'])
+        done_batch.append(ep['done'])
+
+    return {
+        'high_observations': torch.stack(high_obs_batch, dim=0),
+        'high_goals': torch.stack(high_goal_batch, dim=0),
+        'low_observations': torch.stack(low_obs_batch, dim=0),
+        'low_goals': torch.stack(low_goal_batch, dim=0),
+        'low_actions': torch.stack(low_action_batch, dim=0),
+        'rewards': torch.stack(reward_batch, dim=0),
+        'done': torch.stack(done_batch, dim=0),
+    }
 
 
 class MLP(nn.Module):
@@ -472,7 +674,7 @@ class PlanningAgent(nn.Module):
         split_step = 1
         mid_goal_list = [goals]
 
-        while self.terminal(observations, goals).mean < 0.5:
+        while self.terminal(observations, goals).mean < 0.5:  # where P_terminal < 0.5
             if split_step >= self.max_split_steps:
                 break
 
@@ -621,10 +823,10 @@ def evaluate(agent: nn.Module,
         mid_goal_list_info = []
 
         obs_dict, info = env.reset()
-        observations = torch.as_tensor(obs_dict['achieved_goal'], device=device)
+        observations = torch.as_tensor(obs_dict['observation'], device=device)
         goals = torch.as_tensor(obs_dict['desired_goal'], device=device)
         done = info['success']
-        distance_info.append(torch.norm(goals - observations).item())
+        distance_info.append(torch.norm(goals - observations[:goals.shape[-1]]).item())
         roll_reward = 0.0
         roll_step = 0
 
@@ -646,7 +848,7 @@ def evaluate(agent: nn.Module,
 
                 for action in actions_to_execute:
                     obs_dict, reward, terminated, truncated, info = env.step(action.cpu().numpy())
-                    observations = torch.as_tensor(obs_dict['achieved_goal'], device=device)
+                    observations = torch.as_tensor(obs_dict['observation'], device=device)
                     goals = torch.as_tensor(obs_dict['desired_goal'], device=device)
                     done = info['success'] or truncated
                     roll_reward += reward
@@ -655,12 +857,12 @@ def evaluate(agent: nn.Module,
                     if roll_step >= 300:
                         done = True
 
-                    if done:
-                        break
-
                     trajectory_info.append(obs_dict)
                     if mid_goal_list is not None:
                         mid_goal_list_info.append(mid_goal_list)
+
+                    if done:
+                        break
 
         if not use_baseline:
             n_level_goal_achieved, n_level_goal_counts = compute_mid_goal_achieved(trajectory_info, mid_goal_list_info)
@@ -688,15 +890,16 @@ def train(agent: PlanningAgent,
           max_length: int,
           batch_size: int,
           hidden_dims: int,
+          use_fixed_length: bool,
           optimizer: torch.optim.Optimizer | None = None,
-          use_average_model: bool = False,
+          use_average_model: bool = True,
           chunk_size: int | None = None,
           execute_mode: Literal['chunk', 'first'] = 'chunk',
           low_actor_alpha: float = 1.0,
           use_wandb: bool = True,
-          lr: float = 1e-4,
+          lr: float = 1e-5,
           weight_decay: float = 1e-5,
-          train_steps: int = 100_000,
+          train_steps: int = 200_000,
           eval_interval: int = 10_000,
           log_interval: int = 500,
           use_baseline: bool = False,
@@ -712,11 +915,12 @@ def train(agent: PlanningAgent,
         wandb.init(
             mode='online',
             project='Open Maze Training Test',
-            name=f'Length: {max_length}, Batch Size: {batch_size}, Hidden Dims: {hidden_dims}, lr: {lr}, Use Average Model: {use_average_model}, Chunk Size: {chunk_size}, Execute Mode: {execute_mode}, Use Baseline {use_baseline}',
+            name=f'Use Fixed Length: {use_fixed_length} Length: {max_length}, Batch Size: {batch_size}, Hidden Dims: {hidden_dims}, lr: {lr}, Use Average Model: {use_average_model}, Chunk Size: {chunk_size}, Execute Mode: {execute_mode}, Use Baseline {use_baseline}',
             config={
                 'lr': lr,
                 'batch_size': batch_size,
                 'hidden_dims': hidden_dims,
+                'use_fixed_length': use_fixed_length,
                 'length': max_length,
                 'chunk_size': chunk_size,
                 'low_actor_alpha': low_actor_alpha,
@@ -877,7 +1081,7 @@ def train(agent: PlanningAgent,
                     average_agent.train()
                 agent.train()
 
-                plot_distance_roll_scatter([distance_info], [roll_step_info], [success_info], subtitle=eval_count)
+                plot_distance_roll_scatter([distance_info], [roll_step_info], [success_info], subtitle=eval_count, eval_count=eval_count, save_path=f'Distance Roll Scatter Evaluate Epoch_{eval_count}')
 
                 distance.append(distance_info)
                 success.append(success_info)
@@ -915,7 +1119,7 @@ def train(agent: PlanningAgent,
     return log_L, log_optimal_idx, log_tree_depth, distance, success, roll
 
 
-def plot_trajectory_length_histogram(dataset: EpisodeDataset | HierarchicalDataset, max_length: int) -> None:
+def plot_trajectory_length_histogram(dataset: EpisodeDataset | HierarchicalDataset, max_length: int, save_path: str | None = None) -> None:
     length = []
 
     if isinstance(dataset, EpisodeDataset):
@@ -927,14 +1131,18 @@ def plot_trajectory_length_histogram(dataset: EpisodeDataset | HierarchicalDatas
 
     plt.figure(figsize=(25, 5))
     plt.hist(length, bins=max_length, edgecolor='black')
-    plt.title('Trajectory Length Distribution')
-    plt.xlabel('Trajectory Length')
+    plt.title('Trajectory Sample Distribution')
+    plt.xlabel('Trajectory Sample')
     plt.ylabel('Count')
     plt.grid(True)
+
+    if save_path is not None:
+        plt.savefig(save_path)
+
     plt.show()
 
 
-def plot_distance_histogram(dataset: EpisodeDataset | HierarchicalDataset) -> None:
+def plot_distance_histogram(dataset: EpisodeDataset | HierarchicalDataset, save_path: str | None = None) -> None:
     distance = []
 
     if isinstance(dataset, EpisodeDataset):
@@ -944,8 +1152,8 @@ def plot_distance_histogram(dataset: EpisodeDataset | HierarchicalDataset) -> No
             distance.append(torch.norm(end - start, dim=-1).item())
     else:
         for trajectory in dataset:
-            start = trajectory['high_observations'][0]
-            end = trajectory['high_observations'][-1]
+            start = trajectory['high_goals'][0]
+            end = trajectory['high_goals'][-1]
             distance.append(torch.norm(end - start, dim=-1).item())
 
     plt.figure(figsize=(25, 5))
@@ -954,10 +1162,14 @@ def plot_distance_histogram(dataset: EpisodeDataset | HierarchicalDataset) -> No
     plt.xlabel('Distance')
     plt.ylabel('Count')
     plt.grid(True)
+
+    if save_path is not None:
+        plt.savefig(save_path)
+
     plt.show()
 
 
-def plot_evaluate_distance_histogram(distance: List[List[float]]) -> None:
+def plot_evaluate_distance_histogram(distance: List[List[float]], save_path: str | None = None) -> None:
     distance = [x for sublist in distance for x in sublist]
 
     plt.figure(figsize=(25, 5))
@@ -966,26 +1178,35 @@ def plot_evaluate_distance_histogram(distance: List[List[float]]) -> None:
     plt.xlabel('Distance')
     plt.ylabel('Count')
     plt.grid(True)
+
+    if save_path is not None:
+        plt.savefig(save_path)
+
     plt.show()
 
 
-def plot_distance_roll_scatter(distance: List[List[float]], roll: List[List[int]], success: List[List[int]], **subtitle: int) -> None:
+def plot_distance_roll_scatter(distance: List[List[float]], roll: List[List[int]], success: List[List[int]], subtitle: int | None = None, eval_count: int | None = None, save_path: str | None = None) -> None:
     plt.figure(figsize=(25, 5))
 
     for eval_idx, (d_list, r_list, s_list) in enumerate(zip(distance, roll, success)):
         for d, r, s in zip(d_list, r_list, s_list):
-            plt.scatter(d, r, c='green' if s else 'red', alpha=0.7)
+            plt.scatter(d, r, c='green' if s else 'red', alpha=1.0)
             if s:
-                plt.text(d, r, f'E{eval_idx + 1}', fontsize=8)
+                plt.text(d, r, f'E{eval_idx + 1}' if eval_count is None else f'E{eval_count}', fontsize=12)
 
-    plt.title(f'Distance vs Roll Steps Scatter {subtitle}')
+    title = 'Distance vs Roll Step Scatter' if subtitle is None else f'Distance vs Roll Step Scatter - Evaluate Epoch_{subtitle}'
+    plt.title(title)
     plt.xlabel('Distance')
     plt.ylabel('Roll Steps')
     plt.grid(True)
+
+    if save_path is not None:
+        plt.savefig(save_path)
+
     plt.show()
 
 
-def plot_distance_success_rate(distance: List[List[float]], success: List[List[float]], bins: int = 15) -> None:
+def plot_distance_success_rate(distance: List[List[float]], success: List[List[float]], bins: int = 15, save_path: str | None = None) -> None:
     distance = [x for sublist in distance for x in sublist]
     success = [x for sublist in success for x in sublist]
     distance = np.asarray(distance)
@@ -1015,6 +1236,10 @@ def plot_distance_success_rate(distance: List[List[float]], success: List[List[f
     plt.ylabel('Success Rate')
     plt.grid(True)
     plt.ylim(0, 1)
+
+    if save_path is not None:
+        plt.savefig(save_path)
+
     plt.show()
 
 
@@ -1028,15 +1253,16 @@ def main():
 
     device: str = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 
-    chunk_size = 4
+    chunk_size = None
     execute_mode = 'chunk'
     lr = 1e-5
     max_length = 32
     batch_size = 64
-    hidden_dims = 128
+    hidden_dims = 64
     use_average_model = True
-    use_baseline = True
-    file_no = 17
+    use_baseline = False
+    use_fixed_length = True
+    file_no = 7
 
     is_hierarchical = chunk_size is not None
     print(f'is_hierarchical: {is_hierarchical}')
@@ -1050,8 +1276,15 @@ def main():
     print(f'Original Trajectory: {len(minari_dataset)}')
 
     if is_hierarchical:
-        hierarchical_dataset: HierarchicalDataset = HierarchicalDataset.create(minari_dataset, chunk_size=chunk_size, max_length=max_length)
-        hierarchical_data_loader: DataLoader = DataLoader(hierarchical_dataset, batch_sampler=GroupByLengthSampler.create(hierarchical_dataset, drop_last=True, base_memory=(24 * 1024 * 1024), max_batch_size=batch_size))
+        if use_fixed_length:
+            hierarchical_dataset: HierarchicalDataset = HierarchicalDataset.create_fixed_length(minari_dataset, chunk_size=chunk_size, max_length=max_length)
+        else:
+            hierarchical_dataset: HierarchicalDataset = HierarchicalDataset.create(minari_dataset, chunk_size=chunk_size, max_length=max_length)
+
+        if not use_baseline:
+            hierarchical_data_loader: DataLoader = DataLoader(hierarchical_dataset, batch_sampler=GroupByLengthSampler.create(hierarchical_dataset, drop_last=True, base_memory=(24 * 1024 * 1024), max_batch_size=batch_size))
+        else:
+            hierarchical_data_loader: DataLoader = DataLoader(hierarchical_dataset, batch_sampler=GroupByLengthSampler.create(hierarchical_dataset, drop_last=True, base_memory=(24 * 1024 * 1024), max_batch_size=batch_size), collate_fn=hierarchical_random_future_goal_collate_fn)
 
         print(f'Clip Trajectory: {len(hierarchical_dataset)}')
 
@@ -1060,14 +1293,21 @@ def main():
         goal_dim = hierarchical_dataset[0]['high_goals'].shape[-1]
 
         agent: PlanningAgent = PlanningAgent([(obs_dim + goal_dim + goal_dim + 1), hidden_dims, hidden_dims, 1], [(obs_dim + goal_dim), hidden_dims, hidden_dims, goal_dim], [(obs_dim + goal_dim), hidden_dims, hidden_dims, (action_dim * chunk_size)], chunk_size=chunk_size).to(device=device)
-        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, hierarchical_data_loader, max_length, batch_size, hidden_dims, chunk_size=chunk_size, execute_mode=execute_mode, lr=lr, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
+        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, hierarchical_data_loader, max_length, batch_size, hidden_dims, use_fixed_length, chunk_size=chunk_size, execute_mode=execute_mode, lr=lr, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
 
-        plot_trajectory_length_histogram(hierarchical_dataset, max_length // chunk_size)
-        plot_distance_histogram(hierarchical_dataset)
+        plot_trajectory_length_histogram(hierarchical_dataset, max_length // chunk_size, save_path='Trajectory Length Histogram')
+        plot_distance_histogram(hierarchical_dataset, save_path='Trajectory Distance Histogram')
 
     else:
-        episode_dataset: EpisodeDataset = EpisodeDataset.create(minari_dataset, max_length=max_length)
-        episode_data_loader: DataLoader = DataLoader(episode_dataset, batch_sampler=GroupByLengthSampler.create(episode_dataset, drop_last=True, base_memory=(24 * 1024 * 1024), max_batch_size=batch_size))
+        if use_fixed_length:
+            episode_dataset: EpisodeDataset = EpisodeDataset.create_fixed_length(minari_dataset, max_length=max_length)
+        else:
+            episode_dataset: EpisodeDataset = EpisodeDataset.create(minari_dataset, max_length=max_length)
+
+        if not use_baseline:
+            episode_data_loader: DataLoader = DataLoader(episode_dataset, batch_sampler=GroupByLengthSampler.create(episode_dataset, drop_last=True, base_memory=(24 * 1024 * 1024), max_batch_size=batch_size))
+        else:
+            episode_data_loader: DataLoader = DataLoader(episode_dataset, batch_sampler=GroupByLengthSampler.create(episode_dataset, drop_last=True, base_memory=(24 * 1024 * 1024), max_batch_size=batch_size), collate_fn=episode_random_future_goal_collate_fn)
 
         print(f'Clip Trajectory: {len(episode_dataset)}')
 
@@ -1076,14 +1316,14 @@ def main():
         goal_dim = episode_dataset[0]['goals'].shape[-1]
 
         agent: PlanningAgent = PlanningAgent([(obs_dim + goal_dim + goal_dim + 1), hidden_dims, hidden_dims, 1], [(obs_dim + goal_dim), hidden_dims, hidden_dims, goal_dim], [(obs_dim + goal_dim), hidden_dims, hidden_dims, action_dim]).to(device=device)
-        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, episode_data_loader, max_length, batch_size, hidden_dims, lr=lr, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
+        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, episode_data_loader, max_length, batch_size, hidden_dims, use_fixed_length, lr=lr, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
 
-        plot_trajectory_length_histogram(episode_dataset, max_length)
-        plot_distance_histogram(episode_dataset)
+        plot_trajectory_length_histogram(episode_dataset, max_length, save_path='Trajectory Length Histogram')
+        plot_distance_histogram(episode_dataset, save_path='Trajectory Distance Histogram')
 
-    plot_evaluate_distance_histogram(distance)
-    plot_distance_roll_scatter(distance, roll, success)
-    plot_distance_success_rate(distance, success)
+    plot_evaluate_distance_histogram(distance, save_path='Evaluate Distance Histogram')
+    plot_distance_roll_scatter(distance, roll, success, save_path='Distance Roll Scatter')
+    plot_distance_success_rate(distance, success, save_path='Distance Success Rate')
 
 
 if __name__ == '__main__':
