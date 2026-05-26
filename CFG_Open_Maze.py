@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.distributions import Bernoulli, Normal
@@ -183,7 +184,7 @@ class HierarchicalDataset(Dataset):
                 done = done[:random_len]
                 goals = goals[:random_len + 1]
 
-                rewards[-1] = 1.0
+                rewards[-1] = 1
                 done[-1] = True
 
                 T = random_len
@@ -195,20 +196,25 @@ class HierarchicalDataset(Dataset):
                     continue
 
                 usable_T = (remaining_T // chunk_size) * chunk_size
+                start = offset
+                end = offset + usable_T
 
-                high_observations = observations[offset : offset + usable_T + 1 : chunk_size]
-                high_goals = goals[offset : offset + usable_T + 1 : chunk_size]
+                high_observations = observations[start:end + 1:chunk_size]
+                high_goals = goals[start:end + 1:chunk_size]
 
-                low_observations = []
-                low_goals = []
+                low_observations = high_observations[:-1]
+                low_goals = high_goals[1:]
+
                 low_actions = []
+                low_rewards = []
+                low_done = []
 
-                for t in range(offset, offset + usable_T - chunk_size + 1):
-                    low_observations.append(observations[t])
-                    low_goals.append(goals[t + chunk_size])
+                for t in range(start, end, chunk_size):
                     low_actions.append(actions[t:t + chunk_size])
+                    low_rewards.append(rewards[t:t + chunk_size])
+                    low_done.append(done[t:t + chunk_size])
 
-                if len(low_observations) == 0:
+                if len(low_actions) == 0:
                     continue
 
                 data.append({
@@ -219,8 +225,8 @@ class HierarchicalDataset(Dataset):
                     'low_goals': torch.as_tensor(np.asarray(low_goals), dtype=torch.float32),
                     'low_actions': torch.as_tensor(np.asarray(low_actions), dtype=torch.float32),
 
-                    'rewards': torch.as_tensor(rewards[offset:offset + usable_T], dtype=torch.float32),
-                    'done': torch.as_tensor(done[offset:offset + usable_T], dtype=torch.float32),
+                    'rewards': torch.as_tensor(np.asarray(low_rewards), dtype=torch.float32),
+                    'done': torch.as_tensor(np.asarray(low_done), dtype=torch.float32)
                 })
 
         return cls(data)
@@ -269,13 +275,12 @@ class HierarchicalDataset(Dataset):
                     high_observations = seg_observations[0:max_length + 1:chunk_size]
                     high_goals = seg_goals[0:max_length + 1:chunk_size]
 
-                    low_observations = []
-                    low_goals = []
+                    low_observations = high_observations[:-1]
+                    low_goals = high_goals[1:]
+
                     low_actions = []
 
-                    for t in range(0, max_length - chunk_size + 1):
-                        low_observations.append(seg_observations[t])
-                        low_goals.append(seg_goals[t + chunk_size])
+                    for t in range(0, max_length, chunk_size):
                         low_actions.append(seg_actions[t:t + chunk_size])
 
                     data.append({
@@ -287,7 +292,7 @@ class HierarchicalDataset(Dataset):
                         'low_actions': torch.as_tensor(np.asarray(low_actions), dtype=torch.float32),
 
                         'rewards': torch.as_tensor(seg_rewards, dtype=torch.float32),
-                        'done': torch.as_tensor(seg_done, dtype=torch.float32),
+                        'done': torch.as_tensor(seg_done, dtype=torch.float32)
                     })
 
         return cls(data)
@@ -319,6 +324,7 @@ class GroupByLengthSampler(Sampler):
                max_batch_size: int | None = 16,
                shuffle: bool = False,
                drop_last: bool = False) -> Self:
+
         length_to_idx = defaultdict(list)
         all_batches = []
 
@@ -349,10 +355,10 @@ class GroupByLengthSampler(Sampler):
 
 
 def episode_random_future_goal_collate_fn(batch) -> Dict[str, torch.Tensor]:
-    obs_batch = []
-    goal_batch = []
-    action_batch = []
-    reward_batch = []
+    observations_batch = []
+    goals_batch = []
+    actions_batch = []
+    rewards_batch = []
     done_batch = []
 
     for ep in batch:
@@ -363,73 +369,77 @@ def episode_random_future_goal_collate_fn(batch) -> Dict[str, torch.Tensor]:
         done = ep['done']
 
         T = actions.shape[0]
-        obs = observations[:T]
-        future_goal_indices = torch.empty(T, dtype=torch.int64)
+        future_goals_indices = torch.empty(T + 1, dtype=torch.int64)
 
         for i in range(T):
-            future_goal_indices[i] = torch.randint(low=i + 1, high=T + 1, size=(1,))
-        goals = goals[future_goal_indices]
+            future_goals_indices[i] = torch.randint(low=i + 1, high=T + 1, size=(1,))
+        future_goals_indices[T] = torch.as_tensor(T)
+        goals = goals[future_goals_indices]
 
-        obs_batch.append(obs)
-        goal_batch.append(goals)
-        action_batch.append(actions)
-        reward_batch.append(rewards)
+        observations_batch.append(observations)
+        goals_batch.append(goals)
+        actions_batch.append(actions)
+        rewards_batch.append(rewards)
         done_batch.append(done)
 
     return {
-        'observations': torch.stack(obs_batch, dim=0),
-        'goals': torch.stack(goal_batch, dim=0),
-        'actions': torch.stack(action_batch, dim=0),
-        'rewards': torch.stack(reward_batch, dim=0),
+        'observations': torch.stack(observations_batch, dim=0),
+        'goals': torch.stack(goals_batch, dim=0),
+        'actions': torch.stack(actions_batch, dim=0),
+        'rewards': torch.stack(rewards_batch, dim=0),
         'done': torch.stack(done_batch, dim=0),
     }
 
 
 def hierarchical_random_future_goal_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    high_obs_batch = []
-    high_goal_batch = []
-    low_obs_batch = []
-    low_goal_batch = []
-    low_action_batch = []
-    reward_batch = []
+    high_observations_batch = []
+    high_goals_batch = []
+    low_observations_batch = []
+    low_goals_batch = []
+    low_actions_batch = []
+    rewards_batch = []
     done_batch = []
 
     for ep in batch:
         high_observations = ep['high_observations']  # (H + 1, obs_dim)
         high_goals = ep['high_goals']                # (H + 1, goal_dim)
+
         H = high_observations.shape[0] - 1
-        high_obs = high_observations[:H]
-        high_goal_indices = torch.empty(H, dtype=torch.long)
+        high_goals_indices = torch.empty(H + 1, dtype=torch.int64)
 
         for i in range(H):
-            high_goal_indices[i] = torch.randint(low=i + 1, high=H + 1, size=(1,))
+            high_goals_indices[i] = torch.randint(low=i + 1, high=H + 1, size=(1,))
+        high_goals_indices[H] = torch.as_tensor(H)
+        high_goals = high_goals[high_goals_indices]
 
-        sampled_high_goals = high_goals[high_goal_indices]
         low_observations = ep['low_observations']  # (L, obs_dim)
         low_goals = ep['low_goals']                # (L, goal_dim)
         low_actions = ep['low_actions']            # (L, chunk_size, action_dim)
+
         L = low_observations.shape[0]
-        low_goal_indices = torch.empty(L, dtype=torch.int64)
+        low_goals_indices = torch.empty(L, dtype=torch.int64)
 
         for i in range(L):
-            low_goal_indices[i] = torch.randint(low=i, high=L, size=(1,))
+            low_goals_indices[i] = torch.randint(low=i, high=L, size=(1,))
+        low_goals = low_goals[low_goals_indices]
 
-        sampled_low_goals = low_goals[low_goal_indices]
-        high_obs_batch.append(high_obs)
-        high_goal_batch.append(sampled_high_goals)
-        low_obs_batch.append(low_observations)
-        low_goal_batch.append(sampled_low_goals)
-        low_action_batch.append(low_actions)
-        reward_batch.append(ep['rewards'])
+        high_observations_batch.append(high_observations)
+        high_goals_batch.append(high_goals)
+        low_observations_batch.append(low_observations)
+        low_goals_batch.append(low_goals)
+        low_actions_batch.append(low_actions)
+        rewards_batch.append(ep['rewards'])
         done_batch.append(ep['done'])
 
     return {
-        'high_observations': torch.stack(high_obs_batch, dim=0),
-        'high_goals': torch.stack(high_goal_batch, dim=0),
-        'low_observations': torch.stack(low_obs_batch, dim=0),
-        'low_goals': torch.stack(low_goal_batch, dim=0),
-        'low_actions': torch.stack(low_action_batch, dim=0),
-        'rewards': torch.stack(reward_batch, dim=0),
+        'high_observations': torch.stack(high_observations_batch, dim=0),
+        'high_goals': torch.stack(high_goals_batch, dim=0),
+
+        'low_observations': torch.stack(low_observations_batch, dim=0),
+        'low_goals': torch.stack(low_goals_batch, dim=0),
+        'low_actions': torch.stack(low_actions_batch, dim=0),
+
+        'rewards': torch.stack(rewards_batch, dim=0),
         'done': torch.stack(done_batch, dim=0),
     }
 
@@ -459,16 +469,29 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
+    @classmethod
+    def create(cls, dims: List[int],
+               activation_fn: Callable[[], nn.Module] = nn.ReLU,
+               output_activation_fn: Callable[[], nn.Module] = None,
+               dropout: float = None) -> Self:
+
+        return cls(
+            dims=dims,
+            activation_fn=activation_fn,
+            output_activation_fn=output_activation_fn,
+            dropout=dropout
+        )
+
 
 class ShouldSplitNet(nn.Module):
 
-    def __init__(self, dims,
+    def __init__(self, dims: List[int],
                  activation_fn: Callable[[], nn.Module] = nn.ReLU,
                  output_activation_fn: Callable[[], nn.Module] = None,
                  dropout: float = None) -> None:
         super(ShouldSplitNet, self).__init__()
 
-        self.net = MLP(
+        self.net = MLP.create(
             dims,
             activation_fn=activation_fn,
             output_activation_fn=output_activation_fn,
@@ -496,7 +519,7 @@ class ShouldSplitNet(nn.Module):
         return T
 
     @classmethod
-    def create(cls, dims,
+    def create(cls, dims: List[int],
                activation_fn: Callable[[], nn.Module] = nn.ReLU,
                output_activation_fn: Callable[[], nn.Module] = None,
                dropout: float = None) -> Self:
@@ -511,12 +534,13 @@ class ShouldSplitNet(nn.Module):
 
 class MidGoalPredictor(nn.Module):
 
-    def __init__(self, dims, activation_fn: Callable[[], nn.Module] = nn.ReLU,
+    def __init__(self, dims: List[int],
+                 activation_fn: Callable[[], nn.Module] = nn.ReLU,
                  output_activation_fn: Callable[[], nn.Module] = None,
                  dropout: float = None) -> None:
         super(MidGoalPredictor, self).__init__()
 
-        self.net = MLP(
+        self.net = MLP.create(
             dims=dims,
             activation_fn=activation_fn,
             output_activation_fn=output_activation_fn,
@@ -532,9 +556,9 @@ class MidGoalPredictor(nn.Module):
     def compute_planed_likelihood(self, observations: torch.Tensor, goals: torch.Tensor) -> torch.Tensor:
         B, n = observations.shape[0], observations.shape[1] - 1
 
-        s_i = observations[:, :n-1].unsqueeze(2).unsqueeze(3).expand(B, n-1, n-1, n-1, -1)            # shape: (B, n-1, n-1, n-1, obs_dim)
-        g_jp2 = goals[:, 2:n+1].unsqueeze(1).unsqueeze(3).expand(B, n-1, n-1, n-1, -1)                # shape: (B, n-1, n-1, n-1, goal_dim)
-        s_kp1 = observations[:, 1:n].unsqueeze(1).unsqueeze(1)[..., :2].expand(B, n-1, n-1, n-1, -1)  # shape: (B, n-1, n-1, n-1, goal_dim)
+        s_i = observations[:, :n-1].unsqueeze(1).unsqueeze(3).expand(B, n-1, n-1, n-1, -1)  # shape: (B, n-1, n-1, n-1, obs_dim)
+        g_jp2 = goals[:, 2:n+1].unsqueeze(1).unsqueeze(2).expand(B, n-1, n-1, n-1, -1)      # shape: (B, n-1, n-1, n-1, goal_dim)
+        s_kp1 = goals[:, 1:n].unsqueeze(2).unsqueeze(3).expand(B, n-1, n-1, n-1, -1)        # shape: (B, n-1, n-1, n-1, goal_dim)
 
         dist = self(s_i, g_jp2)
         P = dist.log_prob(s_kp1).sum(dim=-1)  # shape: (B, n-1, n-1, n-1)
@@ -546,7 +570,7 @@ class MidGoalPredictor(nn.Module):
         return P
 
     @classmethod
-    def create(cls, dims,
+    def create(cls, dims: List[int],
                activation_fn: Callable[[], nn.Module] = nn.ReLU,
                output_activation_fn: Callable[[], nn.Module] = None,
                dropout: float = None) -> Self:
@@ -561,13 +585,13 @@ class MidGoalPredictor(nn.Module):
 
 class PolicyNet(nn.Module):
 
-    def __init__(self, dims,
+    def __init__(self, dims: List[int],
                  activation_fn: Callable[[], nn.Module] = nn.ReLU,
                  output_activation_fn: Callable[[], nn.Module] = nn.Tanh,
                  dropout: float = None) -> None:
         super(PolicyNet, self).__init__()
 
-        self.net = MLP(
+        self.net = MLP.create(
             dims=dims,
             activation_fn=activation_fn,
             output_activation_fn=output_activation_fn,
@@ -581,7 +605,7 @@ class PolicyNet(nn.Module):
         return Normal(mean, std)
 
     def compute_actor_likelihood(self, observations: torch.Tensor, goals: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        B, n = observations.shape[0], observations.shape[1] - 1
+        B, n = actions.shape[0], actions.shape[1]
 
         s_i = observations[:, :n]  # shape: (B, n, obs_dim)
         g_ip1 = goals[:, 1:]       # shape: (B, n, goal_dim)
@@ -592,7 +616,7 @@ class PolicyNet(nn.Module):
         return A
 
     @classmethod
-    def create(cls, dims,
+    def create(cls, dims: List[int],
                activation_fn: Callable[[], nn.Module] = nn.ReLU,
                output_activation_fn: Callable[[], nn.Module] = nn.Tanh,
                dropout: float = None) -> Self:
@@ -607,7 +631,7 @@ class PolicyNet(nn.Module):
 
 class LowLevelPolicyNet(nn.Module):
 
-    def __init__(self, dims,
+    def __init__(self, dims: List[int],
                  chunk_size: int,
                  activation_fn: Callable[[], nn.Module] = nn.ReLU,
                  output_activation_fn: Callable[[], nn.Module] = nn.Tanh,
@@ -617,7 +641,7 @@ class LowLevelPolicyNet(nn.Module):
         self.chunk_size = chunk_size
         self.action_dim = dims[-1] // chunk_size
 
-        self.net = MLP(
+        self.net = MLP.create(
             dims=dims,
             activation_fn=activation_fn,
             output_activation_fn=output_activation_fn,
@@ -638,7 +662,7 @@ class LowLevelPolicyNet(nn.Module):
         return low_A
 
     @classmethod
-    def create(cls, dims,
+    def create(cls, dims: List[int],
                chunk_size: int,
                activation_fn: Callable[[], nn.Module] = nn.ReLU,
                output_activation_fn: Callable[[], nn.Module] = nn.Tanh,
@@ -653,28 +677,108 @@ class LowLevelPolicyNet(nn.Module):
         )
 
 
+class ExecutionChunkActions(nn.Module):
+
+    def __init__(self, dims: List[int],
+                 chunk_size: int,
+                 action_dim: int,
+                 activation_fn: Callable[[], nn.Module] = nn.ReLU,
+                 output_activation_fn: Callable[[], nn.Module] | None = None,
+                 dropout: float | None = None) -> None:
+        super(ExecutionChunkActions, self).__init__()
+
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+
+        self.net = MLP.create(
+            dims=dims,
+            activation_fn=activation_fn,
+            output_activation_fn=output_activation_fn,
+            dropout=dropout
+        )
+
+    def forward(self, observations: torch.Tensor, chunk_actions: torch.Tensor) -> torch.Tensor:
+        chunk_actions = chunk_actions.reshape(*chunk_actions.shape[:-2], self.chunk_size * self.action_dim)
+        pred_goal = self.net(torch.cat([observations, chunk_actions], dim=-1))
+        return pred_goal
+
+    def compute_execution_loss(self, observations: torch.Tensor, goals: torch.Tensor, chunk_actions: torch.Tensor) -> torch.Tensor:
+        pred_goals = self(observations, chunk_actions)
+        loss = torch.square(pred_goals - goals).sum(dim=-1).mean()
+        return loss
+
+    @classmethod
+    def create(cls, dims: List[int],
+               chunk_size: int,
+               action_dim: int,
+               activation_fn: Callable[[], nn.Module] = nn.ReLU,
+               output_activation_fn: Callable[[], nn.Module] | None = None,
+               dropout: float | None = None) -> Self:
+
+        return cls(
+            dims=dims,
+            chunk_size=chunk_size,
+            action_dim=action_dim,
+            activation_fn=activation_fn,
+            output_activation_fn=output_activation_fn,
+            dropout=dropout
+        )
+
+
+class AffineDistance(nn.Module):
+
+    def __init__(self, beta_init: float = 10.0,
+                 epsilon_init: float = 0.45) -> None:
+        super(AffineDistance, self).__init__()
+
+        self.net = nn.Linear(1, 1)
+
+        with torch.no_grad():
+            self.net.weight.fill_(-beta_init)  # z = -beta * distance + beta * epsilon
+            self.net.bias.fill_(beta_init * epsilon_init)  # bais = beta * epsilon
+
+    def forward(self, distance: torch.Tensor) -> torch.Tensor:
+        logits = self.net(distance.unsqueeze(-1)).squeeze(-1)
+        return logits
+
+    @classmethod
+    def create(cls, beta_init: float = 10.0,
+               epsilon_init: float = 0.45) -> Self:
+
+        return cls(
+            beta_init=beta_init,
+            epsilon_init=epsilon_init
+        )
+
+
 class PlanningAgent(nn.Module):
 
-    def __init__(self, terminal_dims: List,
-                 mid_goal_dims: List,
-                 actor_dims: List,
+    def __init__(self, terminal_dims: List[int],
+                 mid_goal_dims: List[int],
+                 actor_dims: List[int],
+                 execution_dims: List[int] | None = None,
                  chunk_size: int | None = None,
                  max_split_steps: int = 50) -> None:
         super(PlanningAgent, self).__init__()
 
-        self.terminal = ShouldSplitNet.create(terminal_dims)
         self.mid_goal = MidGoalPredictor.create(mid_goal_dims)
         if chunk_size is None:
+            self.terminal = ShouldSplitNet.create(terminal_dims)
             self.actor = PolicyNet.create(actor_dims)
+            self.execution = None
+            self.affine_distance = None
         else:
-            self.actor = LowLevelPolicyNet(actor_dims, chunk_size)
+            self.actor = LowLevelPolicyNet.create(actor_dims, chunk_size)
+            self.execution = ExecutionChunkActions.create(execution_dims, chunk_size, (actor_dims[-1] // chunk_size))
+            self.affine_distance = AffineDistance.create()
+            self.terminal = None
         self.max_split_steps = max_split_steps
 
     def act_agent(self, observations: torch.Tensor, goals: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         split_step = 1
         mid_goal_list = [goals]
 
-        while self.terminal(observations, goals).mean < 0.5:  # where P_terminal < 0.5
+        while self.terminal(observations, goals).mean < 0.5:  # where P_terminal(t=1) < 0.5
             if split_step >= self.max_split_steps:
                 break
 
@@ -686,13 +790,66 @@ class PlanningAgent(nn.Module):
 
         return self.actor(observations, goals).mean, mid_goal_list
 
+    def act_chunk_agent(self, observations: torch.Tensor, goals: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+
+        def compute_terminal_prob(current_goals: torch.Tensor) -> torch.Tensor:
+            chunk_actions = self.actor(observations, current_goals).mean
+            pred_goals = self.execution(observations, chunk_actions)
+
+            distance = torch.norm(pred_goals - current_goals, dim=-1)
+
+            terminal_logits = self.affine_distance(distance)
+            terminal_prob = torch.sigmoid(terminal_logits)
+
+            return terminal_prob
+
+        split_step = 1
+        mid_goal_list = [goals]
+
+        terminal_prob = compute_terminal_prob(goals)
+
+        while terminal_prob.mean().item() < 0.5:
+            if split_step >= self.max_split_steps:
+                break
+
+            split_step += 1
+            goals = self.mid_goal(observations, goals).mean
+            mid_goal_list.append(goals)
+
+            terminal_prob = compute_terminal_prob(goals)
+
+        mid_goal_list.reverse()
+
+        return self.actor(observations, goals).mean, mid_goal_list
+
     def act_baseline(self, observations: torch.Tensor, goals: torch.Tensor) -> torch.Tensor:
         return self.actor(observations, goals).mean
 
 
-def compute_total_likelihood(T: torch.Tensor,  # shape: (B, n, n)
+def compute_chunk_execution_terminal_likelihood(agent: PlanningAgent, observations: torch.Tensor, goals: torch.Tensor) -> torch.Tensor:
+    B, n = observations.shape[0], observations.shape[1] - 1
+
+    s_i = observations[:, :n].unsqueeze(2).expand(B, n, n, -1)
+    g_jp1 = goals[:, 1:].unsqueeze(1).expand(B, n, n, -1)
+    terminal = torch.eye(n, dtype=torch.float32, device=observations.device).unsqueeze(0)
+
+    chunk_actions = agent.actor(s_i, g_jp1).mean
+    pred_goals = agent.execution(s_i, chunk_actions)
+
+    distance = torch.norm(pred_goals - g_jp1, dim=-1)
+    terminal_logits = agent.affine_distance(distance)
+
+    dist = Bernoulli(logits=terminal_logits)
+    T = dist.log_prob(terminal)
+
+    T_mask = torch.triu(torch.ones((n, n), dtype=torch.bool, device=observations.device))
+    T = T.masked_fill(~T_mask.unsqueeze(0), -float('inf'))
+    return T
+
+
+def compute_total_likelihood(A: torch.Tensor,  # shape: (B, n)
+                             T: torch.Tensor,  # shape: (B, n, n)
                              P: torch.Tensor,  # shape: (B, n-1, n-1, n-1)
-                             A: torch.Tensor | None = None,  # shape: (B, n)
                              use_optimal_path: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, n, _ = T.shape
     L = torch.full((B, n, n), -float('inf'), dtype=torch.float32, device=T.device)
@@ -776,30 +933,30 @@ def compute_mid_goal_achieved(trajectory_info: List[Dict[str, np.ndarray]],
                               threshold: float = 0.45) -> Tuple[List[int], List[int]]:
     n_level_goal_achieved = [0] * max_split_step
     n_level_goal_counts = [0] * max_split_step
+    num_decisions = min(len(trajectory_info), len(mid_goal_list_info))
 
-    for i, mid_goal_list in enumerate(mid_goal_list_info[:-1]):
-        mid_goal = [mg.detach().cpu().numpy() for mg in mid_goal_list]
-        trajectory_achieved_goal = [step['achieved_goal'] for step in trajectory_info[i + 1:]]
+    for i in range(num_decisions):
+        mid_goal_list = mid_goal_list_info[i]
+        mid_goals = [mg.detach().cpu().numpy() for mg in mid_goal_list]
 
-        for j in range(len(mid_goal_list)):
-            n_level_goal_counts[j] += 1
+        for level, mid_goal in enumerate(mid_goals):
+            target_trajectory_idx = i + level
 
-        if float(np.linalg.norm(trajectory_achieved_goal[0] - mid_goal[0])) < threshold:
-            n_level_goal_achieved[0] += 1
+            if target_trajectory_idx >= len(trajectory_info):
+                break
 
-            target_idx = 1
-            for achieved_goal in trajectory_achieved_goal[1:]:
-                if target_idx >= len(mid_goal):
-                    break
+            achieved_goal = trajectory_info[target_trajectory_idx]['achieved_goal']
+            n_level_goal_counts[level] += 1
 
-                if float(np.linalg.norm(achieved_goal - mid_goal[target_idx])) < threshold:
-                    n_level_goal_achieved[target_idx] += 1
-                    target_idx += 1
+            if float(np.linalg.norm(achieved_goal - mid_goal)) < threshold:
+                n_level_goal_achieved[level] += 1
+            else:
+                break
 
     return n_level_goal_achieved, n_level_goal_counts
 
 
-def evaluate(agent: nn.Module,
+def evaluate(agent: PlanningAgent,
              env: gym.Env,
              chunk_size: int | None = None,
              execute_mode: Literal['chunk', 'first'] = 'chunk',
@@ -826,14 +983,19 @@ def evaluate(agent: nn.Module,
         observations = torch.as_tensor(obs_dict['observation'], device=device)
         goals = torch.as_tensor(obs_dict['desired_goal'], device=device)
         done = info['success']
+
         distance_info.append(torch.norm(goals - observations[:goals.shape[-1]]).item())
         roll_reward = 0.0
         roll_step = 0
+        reward = 0.0
 
         while not done:
             with torch.no_grad():
                 if not use_baseline:
-                    actions, mid_goal_list = agent.act_agent(observations, goals)
+                    if chunk_size is None:
+                        actions, mid_goal_list = agent.act_agent(observations, goals)
+                    else:
+                        actions, mid_goal_list = agent.act_chunk_agent(observations, goals)
                 else:
                     actions = agent.act_baseline(observations, goals)
                     mid_goal_list = None
@@ -857,12 +1019,12 @@ def evaluate(agent: nn.Module,
                     if roll_step >= 300:
                         done = True
 
-                    trajectory_info.append(obs_dict)
-                    if mid_goal_list is not None:
-                        mid_goal_list_info.append(mid_goal_list)
-
                     if done:
                         break
+
+                trajectory_info.append(obs_dict)
+                if mid_goal_list is not None:
+                    mid_goal_list_info.append(mid_goal_list)
 
         if not use_baseline:
             n_level_goal_achieved, n_level_goal_counts = compute_mid_goal_achieved(trajectory_info, mid_goal_list_info)
@@ -889,13 +1051,14 @@ def train(agent: PlanningAgent,
           dataloader: DataLoader,
           max_length: int,
           batch_size: int,
-          hidden_dims: int,
+          hidden_dim: int,
           use_fixed_length: bool,
+          run_name: str = 'Default Run Name',
           optimizer: torch.optim.Optimizer | None = None,
           use_average_model: bool = True,
           chunk_size: int | None = None,
           execute_mode: Literal['chunk', 'first'] = 'chunk',
-          low_actor_alpha: float = 1.0,
+          execution_alpha: float = 1.0,
           use_wandb: bool = True,
           lr: float = 1e-5,
           weight_decay: float = 1e-5,
@@ -914,16 +1077,16 @@ def train(agent: PlanningAgent,
     if use_wandb:
         wandb.init(
             mode='online',
-            project='Open Maze Training Test',
-            name=f'Use Fixed Length: {use_fixed_length} Length: {max_length}, Batch Size: {batch_size}, Hidden Dims: {hidden_dims}, lr: {lr}, Use Average Model: {use_average_model}, Chunk Size: {chunk_size}, Execute Mode: {execute_mode}, Use Baseline {use_baseline}',
+            project='Open Maze Training Test v2',
+            name=run_name,
             config={
                 'lr': lr,
                 'batch_size': batch_size,
-                'hidden_dims': hidden_dims,
+                'hidden_dims': hidden_dim,
                 'use_fixed_length': use_fixed_length,
                 'length': max_length,
                 'chunk_size': chunk_size,
-                'low_actor_alpha': low_actor_alpha,
+                'execution_alpha': execution_alpha,
                 'is_hierarchical': is_hierarchical,
                 'use_average_model': use_average_model,
                 'use_baseline': use_baseline,
@@ -968,32 +1131,33 @@ def train(agent: PlanningAgent,
 
             if not use_baseline:
                 if is_hierarchical:
-                    high_observations = batch['high_observations']
-                    high_goals = batch['high_goals']
+                    high_observations = batch['high_observations']  # shape: (B, n+1, obs_dim)
+                    high_goals = batch['high_goals']                # shape: (B, n+1, goal_dim)
 
-                    low_observations = batch['low_observations']
-                    low_goals = batch['low_goals']
-                    low_actions = batch['low_actions']
+                    low_observations = batch['low_observations']    # shape: (B, n, obs_dim)
+                    low_goals = batch['low_goals']                  # shape: (B, n, goal_dim)
+                    low_actions = batch['low_actions']              # shape: (B, n, chunk_size, action_dim)
 
                     B, n = high_observations.shape[0], high_observations.shape[1] - 1
 
                     low_A = agent.actor.compute_low_level_likelihood(low_observations, low_goals, low_actions)
-
-                    T = agent.terminal.compute_terminal_likelihood(high_observations, high_goals)
+                    T = compute_chunk_execution_terminal_likelihood(agent, high_observations, high_goals)
                     P = agent.mid_goal.compute_planed_likelihood(high_observations, high_goals)
 
-                    L, optimal_idx, tree_depth = compute_total_likelihood(T, P, A=None)     # shape: (B, n, n)
+                    L, optimal_idx, tree_depth = compute_total_likelihood(low_A, T, P)     # shape: (B, n, n)
                     n = L.shape[1]
                     high_loss = -L[:, 0, n - 1].mean() / n
 
                     actor_loss = -low_A.mean()
 
-                    loss = high_loss + low_actor_alpha * actor_loss
+                    execution_loss = agent.execution.compute_execution_loss(low_observations, low_goals, low_actions)
+
+                    loss = (high_loss + execution_alpha * execution_loss)
 
                 else:
                     observations = batch['observations']  # shape: (B, n+1, obs_dim)
-                    actions = batch['actions']  # shape: (B, n, action_dim)
-                    goals = batch['goals']  # shape: (B, n+1, goal_dim)
+                    actions = batch['actions']            # shape: (B, n, action_dim)
+                    goals = batch['goals']                # shape: (B, n+1, goal_dim)
                     B, n = observations.shape[0], observations.shape[1] - 1
 
                     A = agent.actor.compute_actor_likelihood(observations, goals, actions)  # shape: (B, n)
@@ -1001,11 +1165,13 @@ def train(agent: PlanningAgent,
                     P = agent.mid_goal.compute_planed_likelihood(observations, goals)       # shape: (B, n-1, n-1, n-1)
 
                     actor_loss = -A.mean()
-                    L, optimal_idx, tree_depth = compute_total_likelihood(T, P, A=A)        # shape: (B, n, n)
+                    L, optimal_idx, tree_depth = compute_total_likelihood(A, T, P)        # shape: (B, n, n)
 
                     n = L.shape[1]
                     loss = -L[:, 0, n - 1].mean() / n  # L[0, n-1] maximize likelihood
                     high_loss = loss
+
+                    execution_loss = torch.tensor(0.0, device=device)
 
                 T_mask = torch.triu(torch.ones(n, n, dtype=torch.bool, device=device)).unsqueeze(0)  # shape: (1, n, n)
                 T_ref = T[T_mask.expand(B, -1, -1)]
@@ -1040,19 +1206,39 @@ def train(agent: PlanningAgent,
 
                 high_loss = torch.tensor(0.0, device=device)
                 terminal_loss = torch.tensor(0.0, device=device)
+                execution_loss = torch.tensor(0.0, device=device)
 
             recent_loss.append(loss.item())
             average_loss = sum(recent_loss) / len(recent_loss)
 
             optimizer.zero_grad()
             loss.backward()
+
             actor_grad = nn.utils.clip_grad_norm_(parameters=agent.actor.parameters(), max_norm=1, norm_type=2)
             if not use_baseline:
-                terminal_grad = nn.utils.clip_grad_norm_(parameters=agent.terminal.parameters(), max_norm=1, norm_type=2)
                 mid_goal_grad = nn.utils.clip_grad_norm_(parameters=agent.mid_goal.parameters(), max_norm=1, norm_type=2)
             else:
-                terminal_grad = torch.tensor(0.0)
-                mid_goal_grad = torch.tensor(0.0)
+                mid_goal_grad = torch.tensor(0.0, device=device)
+
+            if not use_baseline and agent.terminal is not None:
+                terminal_grad = nn.utils.clip_grad_norm_(parameters=agent.terminal.parameters(), max_norm=1,  norm_type=2)
+            else:
+                terminal_grad = torch.tensor(0.0, device=device)
+
+            if not use_baseline and agent.execution is not None:
+                execution_grad = nn.utils.clip_grad_norm_(parameters=agent.execution.parameters(), max_norm=1, norm_type=2)
+            else:
+                execution_grad = torch.tensor(0.0, device=device)
+
+            if not use_baseline and agent.affine_distance is not None:
+                affine_grad = nn.utils.clip_grad_norm_( parameters=agent.affine_distance.parameters(), max_norm=1, norm_type=2)
+                affine_weight = agent.affine_distance.net.weight.detach().mean()
+                affine_bias = agent.affine_distance.net.bias.detach().mean()
+            else:
+                affine_grad = torch.tensor(0.0, device=device)
+                affine_weight = torch.tensor(0.0, device=device)
+                affine_bias = torch.tensor(0.0, device=device)
+
             optimizer.step()
             if use_average_model:
                 average_agent.update_parameters(agent)
@@ -1068,9 +1254,14 @@ def train(agent: PlanningAgent,
                     'Train/Average Loss': average_loss,
                     'Train/Actor Loss': actor_loss.item(),
                     'Train/Terminal Loss': terminal_loss.item(),
-                    'Train/Actor Grad': actor_grad,
-                    'Train/Terminal Grad': terminal_grad,
-                    'Train/Mid Goal Grad': mid_goal_grad
+                    'Train/Execution Loss': execution_loss.item(),
+                    'Train/Actor Grad': actor_grad.item(),
+                    'Train/Terminal Grad': terminal_grad.item(),
+                    'Train/Mid Goal Grad': mid_goal_grad.item(),
+                    'Train/Execution Grad': execution_grad.item(),
+                    'Train/Affine Grad': affine_grad.item(),
+                    'Train/Affine Weight': affine_weight.item(),
+                    'Train/Affine Bias': affine_bias.item(),
                 }, step=step)
 
             if step % eval_interval == 0 or step == train_steps:
@@ -1088,6 +1279,14 @@ def train(agent: PlanningAgent,
                 roll.append(roll_step_info)
                 success_rate.append(success_rate_info)
 
+                first_mid_goal_success_rate = [rate[0] for rate in success_rate_info if len(rate) > 0]
+                if len(first_mid_goal_success_rate) > 0:
+                    first_mid_goal_success_rate_mean = float(np.mean(first_mid_goal_success_rate))
+                    first_mid_goal_success_rate_std = float(np.std(first_mid_goal_success_rate))
+                else:
+                    first_mid_goal_success_rate_mean = 0.0
+                    first_mid_goal_success_rate_std = 0.0
+
                 if use_wandb:
                     wandb.log({
                         'Evaluate/Distance Mean': np.mean(distance_info),
@@ -1097,7 +1296,9 @@ def train(agent: PlanningAgent,
                         'Evaluate/Roll Step Mean': np.mean(roll_step_info),
                         'Evaluate/Roll Step Std': np.std(roll_step_info),
                         'Evaluate/Total Reward Mean': np.mean(reward_info),
-                        'Evaluate/Total Reward Std': np.std(reward_info)
+                        'Evaluate/Total Reward Std': np.std(reward_info),
+                        'Evaluate/First Mid Goal Success Rate Mean': first_mid_goal_success_rate_mean,
+                        'Evaluate/First Mid Goal Success Rate Std': first_mid_goal_success_rate_std
                     }, step=step)
 
     pbar.close()
@@ -1119,7 +1320,7 @@ def train(agent: PlanningAgent,
     return log_L, log_optimal_idx, log_tree_depth, distance, success, roll
 
 
-def plot_trajectory_length_histogram(dataset: EpisodeDataset | HierarchicalDataset, max_length: int, save_path: str | None = None) -> None:
+def plot_trajectory_step_histogram(dataset: EpisodeDataset | HierarchicalDataset, max_length: int, save_path: str | None = None) -> None:
     length = []
 
     if isinstance(dataset, EpisodeDataset):
@@ -1127,12 +1328,12 @@ def plot_trajectory_length_histogram(dataset: EpisodeDataset | HierarchicalDatas
             length.append(trajectory['actions'].shape[0])
     else:
         for trajectory in dataset:
-            length.append(trajectory['high_observations'].shape[0])
+            length.append((trajectory['high_observations'].shape[0] - 1))
 
     plt.figure(figsize=(25, 5))
     plt.hist(length, bins=max_length, edgecolor='black')
-    plt.title('Trajectory Sample Distribution')
-    plt.xlabel('Trajectory Sample')
+    plt.title('Trajectory Step Distribution')
+    plt.xlabel('Trajectory Step')
     plt.ylabel('Count')
     plt.grid(True)
 
@@ -1147,13 +1348,13 @@ def plot_distance_histogram(dataset: EpisodeDataset | HierarchicalDataset, save_
 
     if isinstance(dataset, EpisodeDataset):
         for trajectory in dataset:
-            start = trajectory['observations'][0]
-            end = trajectory['observations'][-1]
+            start = trajectory['observations'][0][:trajectory['goals'].shape[-1]]
+            end = trajectory['observations'][-1][:trajectory['goals'].shape[-1]]
             distance.append(torch.norm(end - start, dim=-1).item())
     else:
         for trajectory in dataset:
-            start = trajectory['high_goals'][0]
-            end = trajectory['high_goals'][-1]
+            start = trajectory['high_observations'][0][:trajectory['high_goals'].shape[-1]]
+            end = trajectory['high_observations'][-1][:trajectory['high_goals'].shape[-1]]
             distance.append(torch.norm(end - start, dim=-1).item())
 
     plt.figure(figsize=(25, 5))
@@ -1253,16 +1454,18 @@ def main():
 
     device: str = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 
-    chunk_size = None
-    execute_mode = 'chunk'
     lr = 1e-5
     max_length = 32
     batch_size = 64
-    hidden_dims = 64
+    hidden_dim = 64
+    use_fixed_length = True
+
+    run_name = 'CFG with Chunk Action with Average Model'
+    chunk_size = 4
+    execute_mode = 'chunk'
     use_average_model = True
     use_baseline = False
-    use_fixed_length = True
-    file_no = 7
+    file_no = 2
 
     is_hierarchical = chunk_size is not None
     print(f'is_hierarchical: {is_hierarchical}')
@@ -1292,10 +1495,15 @@ def main():
         action_dim = hierarchical_dataset[0]['low_actions'].shape[-1]
         goal_dim = hierarchical_dataset[0]['high_goals'].shape[-1]
 
-        agent: PlanningAgent = PlanningAgent([(obs_dim + goal_dim + goal_dim + 1), hidden_dims, hidden_dims, 1], [(obs_dim + goal_dim), hidden_dims, hidden_dims, goal_dim], [(obs_dim + goal_dim), hidden_dims, hidden_dims, (action_dim * chunk_size)], chunk_size=chunk_size).to(device=device)
-        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, hierarchical_data_loader, max_length, batch_size, hidden_dims, use_fixed_length, chunk_size=chunk_size, execute_mode=execute_mode, lr=lr, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
+        terminal_dims = [(obs_dim + goal_dim + goal_dim + 1), hidden_dim, hidden_dim, 1]
+        mid_goal_dims = [(obs_dim + goal_dim), hidden_dim, hidden_dim, goal_dim]
+        actor_dims = [(obs_dim + goal_dim), hidden_dim, hidden_dim, (action_dim * chunk_size)]
+        execution_dims = [(obs_dim + action_dim * chunk_size), hidden_dim, hidden_dim, goal_dim]
 
-        plot_trajectory_length_histogram(hierarchical_dataset, max_length // chunk_size, save_path='Trajectory Length Histogram')
+        agent: PlanningAgent = PlanningAgent(terminal_dims, mid_goal_dims, actor_dims, execution_dims, chunk_size=chunk_size).to(device=device)
+        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, hierarchical_data_loader, max_length, batch_size, hidden_dim, use_fixed_length, run_name=run_name, chunk_size=chunk_size, execute_mode=execute_mode, lr=lr, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
+
+        plot_trajectory_step_histogram(hierarchical_dataset, max_length // chunk_size, save_path='Trajectory Length Histogram')
         plot_distance_histogram(hierarchical_dataset, save_path='Trajectory Distance Histogram')
 
     else:
@@ -1315,10 +1523,14 @@ def main():
         action_dim = episode_dataset[0]['actions'].shape[-1]
         goal_dim = episode_dataset[0]['goals'].shape[-1]
 
-        agent: PlanningAgent = PlanningAgent([(obs_dim + goal_dim + goal_dim + 1), hidden_dims, hidden_dims, 1], [(obs_dim + goal_dim), hidden_dims, hidden_dims, goal_dim], [(obs_dim + goal_dim), hidden_dims, hidden_dims, action_dim]).to(device=device)
-        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, episode_data_loader, max_length, batch_size, hidden_dims, use_fixed_length, lr=lr, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
+        terminal_dims = [(obs_dim + goal_dim + goal_dim + 1), hidden_dim, hidden_dim, 1]
+        mid_goal_dims = [(obs_dim + goal_dim), hidden_dim, hidden_dim, goal_dim]
+        actor_dims = [(obs_dim + goal_dim), hidden_dim, hidden_dim, action_dim]
 
-        plot_trajectory_length_histogram(episode_dataset, max_length, save_path='Trajectory Length Histogram')
+        agent: PlanningAgent = PlanningAgent(terminal_dims, mid_goal_dims, actor_dims).to(device=device)
+        log_L, log_optimal_idx, log_tree_depth, distance, success, roll = train(agent, env, episode_data_loader, max_length, batch_size, hidden_dim, use_fixed_length, lr=lr, run_name=run_name, use_average_model=use_average_model, use_baseline=use_baseline, planner_save_path=planner_save_path, l_save_path=l_save_path, optimal_idx_save_path=optimal_idx_save_path, tree_depth_save_path=tree_depth_save_path, device=device)
+
+        plot_trajectory_step_histogram(episode_dataset, max_length, save_path='Trajectory Length Histogram')
         plot_distance_histogram(episode_dataset, save_path='Trajectory Distance Histogram')
 
     plot_evaluate_distance_histogram(distance, save_path='Evaluate Distance Histogram')
