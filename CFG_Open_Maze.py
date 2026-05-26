@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.distributions import Bernoulli, Normal
